@@ -6,18 +6,21 @@ Usage:
     python ingest_test.py --url "..." --session-id my-test-session
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+
+import instrumentation  # must be before any anthropic import
+instrumentation.setup()
+
 import argparse
 import asyncio
 import os
-import sys
 import tempfile
 import uuid
-from pathlib import Path
 
 import yt_dlp
 from deepgram import DeepgramClient
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 from config import settings
 from services.redis_service import (
@@ -126,3 +129,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     asyncio.run(main(args.url, args.session_id))
+    instrumentation.shutdown()

@@ -1,6 +1,18 @@
 {
   "version": 1,
   "skills": {
+    "arize-evaluator": {
+      "source": "Arize-ai/arize-skills",
+      "sourceType": "github",
+      "skillPath": "skills/arize-evaluator/SKILL.md",
+      "computedHash": "cc23c98f44cb781acfe56d38bdb2b88bb9241955f0e05ef6483c83178c8ee7d5"
+    },
+    "arize-instrumentation": {
+      "source": "Arize-ai/arize-skills",
+      "sourceType": "github",
+      "skillPath": "skills/arize-instrumentation/SKILL.md",
+      "computedHash": "28b82ea988fcc683389ad8d99f5b329a02b188d831fe1f69c88e597141fa3164"
+    },
     "redis-core": {
       "source": "redis/agent-skills",
       "sourceType": "github",

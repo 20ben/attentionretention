@@ -1,0 +1,5 @@
+[openinference_instrumentor]
+anthropic = openinference.instrumentation.anthropic:AnthropicInstrumentor
+
+[opentelemetry_instrumentor]
+anthropic = openinference.instrumentation.anthropic:AnthropicInstrumentor
