@@ -107,7 +107,7 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
     return json.loads(raw)
 
 
-API_BASE = os.environ.get("QUESTION_API_URL", "http://192.168.56.1:3000").rstrip("/")
+API_BASE = os.environ.get("QUESTION_API_URL", "http://10.43.39.220:3000").rstrip("/")
 
 
 async def send_question(question_data: dict) -> str | None:

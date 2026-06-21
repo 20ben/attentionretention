@@ -57,6 +57,7 @@ async def ensure_vector_index(redis: aioredis.Redis) -> None:
 
 async def append_transcript(session_id: str, text: str, redis: aioredis.Redis) -> None:
     await redis.rpush(f"transcript:{session_id}", text)
+    await redis.publish("transcript-events", session_id)
 
 async def get_recent_transcript(
     session_id: str, redis: aioredis.Redis, n: int = 20
