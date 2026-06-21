@@ -40,11 +40,7 @@ def _redis_connect_url(redis_url: str) -> tuple[str, dict]:
 
 
 def _redis_fallback_urls() -> list[str]:
-    urls = [settings.redis_url]
-    local_url = "redis://localhost:6379"
-    if settings.redis_url != local_url:
-        urls.append(local_url)
-    return urls
+    return [settings.redis_url]
 
 
 UTTERANCES = [

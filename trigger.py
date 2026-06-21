@@ -76,8 +76,6 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
                         "options": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "minItems": 4,
-                            "maxItems": 4,
                         },
                         "correct_answer": {
                             "type": "string",
@@ -109,7 +107,7 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
     return json.loads(raw)
 
 
-API_BASE = os.environ.get("QUESTION_API_URL", "http://10.43.110.207:3000").rstrip("/")
+API_BASE = os.environ.get("QUESTION_API_URL", "http://192.168.56.1:3000").rstrip("/")
 
 
 async def send_question(question_data: dict) -> str | None:
@@ -164,7 +162,7 @@ async def send_feedback(question_id: str, session_id: str, explanation: str) -> 
                 "question_id": question_id,
                 "session_id": session_id,
                 "explanation": explanation,
-            }, timeout=10.0)
+            }, timeout=300.0)
             r.raise_for_status()
             print(f"[api] feedback delivered → {r.status_code}")
         except Exception as exc:
