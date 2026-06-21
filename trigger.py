@@ -22,8 +22,8 @@ from services.redis_service import (
     upsert_question,
 )
 
-MIN_UTTERANCES = 5       # don't consider asking until session has at least this many
-MIN_NEW_UTTERANCES = 10   # minimum new utterances since last question before re-checking
+MIN_UTTERANCES = 7       # don't consider asking until session has at least this many
+MIN_NEW_UTTERANCES = 7   # minimum new utterances since last question before re-checking
 CONTEXT_WINDOW = 15      # number of recent utterances to pass to Claude
 
 # Per-session throttle: maps session_id -> transcript length when last question was generated
@@ -53,7 +53,7 @@ async def is_good_time_to_ask(recent: list[str], client: anthropic.AsyncAnthropi
                 "Reply YES if the lecturer just finished explaining a concept or reached "
                 "a natural pause or topic transition.\n"
                 "Reply NO if the explanation is still mid-thought.\n\n"
-                f"Recent transcript:\n{transcript_text}"
+                f"Recent video context:\n{transcript_text}"
             ),
         }],
     )
@@ -95,9 +95,9 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
         messages=[{
             "role": "user",
             "content": (
-                "You are an expert educator. Based on the following lecture transcript, "
+                "You are an expert educator. Based on the following snippet of the lecture, "
                 "generate one multiple-choice comprehension question with exactly 4 options (A–D).\n\n"
-                f"Recent transcript:\n{transcript_text}\n\n"
+                f"Recent video context:\n{transcript_text}\n\n"
                 "Return JSON with fields: question (string), options (array of 4 answer strings), "
                 "correct_answer ('A'|'B'|'C'|'D'), topic (string), difficulty ('easy'|'medium'|'hard')."
             ),
@@ -148,7 +148,7 @@ async def generate_explanation(
             f"Question: {question_data['question']}\n"
             f"Options:\n{options_text}\n"
             f"Student selected: {answer} — Correct answer: {correct}. {correct_text}\n\n"
-            f"Lecture transcript for context:\n{transcript_text}\n\n"
+            f"Lecture video snippet for context:\n{transcript_text}\n\n"
             "Write a brief, friendly explanation of why the correct answer is right."
         )}],
     )
@@ -171,6 +171,8 @@ async def send_feedback(question_id: str, session_id: str, explanation: str) -> 
 
 async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
     """Handle a new utterance pushed onto transcript:{session_id}."""
+    last_at = _last_question_at.get(session_id, 0)
+    question_committed = False
     try:
         length = await transcript_length(session_id, redis)
 
@@ -178,26 +180,29 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
             print(f"[{session_id}] skip: only {length}/{MIN_UTTERANCES} utterances")
             return
 
-        last_at = _last_question_at.get(session_id, 0)
         if length - last_at < MIN_NEW_UTTERANCES:
             print(f"[{session_id}] skip: only {length - last_at}/{MIN_NEW_UTTERANCES} new utterances since last question")
             return
 
+        # Reserve immediately so concurrent tasks don't also pass the throttle check.
+        # Released back to last_at on any path that doesn't produce a question.
+        _last_question_at[session_id] = length
+
         recent = await get_recent_transcript(session_id, redis, n=CONTEXT_WINDOW)
         if not recent:
+            _last_question_at[session_id] = last_at
             return
 
         client = _get_client()
 
         # Step 1: fast, cheap classification
         if not await is_good_time_to_ask(recent, client):
+            _last_question_at[session_id] = last_at
             return
 
         # Step 2: generate the comprehension question
         question_data = await generate_question(recent, client)
-
-        # Commit the throttle position only after a question is actually generated
-        _last_question_at[session_id] = length
+        question_committed = True  # question will be sent; reservation is now permanent
 
         qid = str(uuid.uuid4())
         payload = {
@@ -223,6 +228,8 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
             await send_feedback(qid, session_id, explanation)
 
     except Exception as exc:
+        if not question_committed:
+            _last_question_at[session_id] = last_at
         print(f"[{session_id}] error in on_transcript_push: {exc}")
 
 
