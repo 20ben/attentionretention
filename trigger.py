@@ -61,7 +61,7 @@ async def is_good_time_to_ask(recent: list[str], client: anthropic.AsyncAnthropi
 
 
 async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic) -> dict:
-    """Use Claude Opus to generate a comprehension question from the recent transcript."""
+    """Use Claude Opus to generate an MCQ from the recent transcript."""
     transcript_text = "\n".join(f"[{i + 1}] {u}" for i, u in enumerate(recent))
     resp = await client.messages.create(
         model="claude-opus-4-8",
@@ -73,13 +73,23 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
                     "type": "object",
                     "properties": {
                         "question": {"type": "string"},
+                        "options": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                        },
+                        "correct_answer": {
+                            "type": "string",
+                            "enum": ["A", "B", "C", "D"],
+                        },
                         "topic": {"type": "string"},
                         "difficulty": {
                             "type": "string",
                             "enum": ["easy", "medium", "hard"],
                         },
                     },
-                    "required": ["question", "topic", "difficulty"],
+                    "required": ["question", "options", "correct_answer", "topic", "difficulty"],
                     "additionalProperties": False,
                 },
             }
@@ -88,11 +98,10 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
             "role": "user",
             "content": (
                 "You are an expert educator. Based on the following lecture transcript, "
-                "generate one comprehension question to check student understanding of "
-                "the material just covered.\n\n"
+                "generate one multiple-choice comprehension question with exactly 4 options (A–D).\n\n"
                 f"Recent transcript:\n{transcript_text}\n\n"
-                "Return JSON with fields: question (string), topic (string), "
-                "difficulty ('easy' | 'medium' | 'hard')."
+                "Return JSON with fields: question (string), options (array of 4 answer strings), "
+                "correct_answer ('A'|'B'|'C'|'D'), topic (string), difficulty ('easy'|'medium'|'hard')."
             ),
         }],
     )
@@ -100,18 +109,66 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
     return json.loads(raw)
 
 
-async def send_to_api(payload: dict) -> None:
-    """POST the question payload to QUESTION_WEBHOOK_URL if configured."""
-    url = os.environ.get("QUESTION_WEBHOOK_URL", "").strip()
-    if not url:
-        return
+API_BASE = os.environ.get("QUESTION_API_URL", "http://10.43.110.207:3000").rstrip("/")
+
+
+async def send_question(question_data: dict) -> str | None:
+    """POST MCQ to /api/send and return the user's selected answer (A/B/C/D)."""
     async with httpx.AsyncClient() as http:
         try:
-            r = await http.post(url, json=payload, timeout=100.0)
+            r = await http.post(f"{API_BASE}/api/send", json={
+                "type": "mcq",
+                "question": question_data["question"],
+                "options": question_data["options"],
+            }, timeout=300.0)
             r.raise_for_status()
-            print(f"[webhook] delivered to {url} → {r.status_code}")
+            body = r.json()
+            answer = body.get("answer") or body.get("response") or body.get("text")
+            print(f"[api] question sent, got answer: {answer!r}")
+            return answer
         except Exception as exc:
-            print(f"[webhook] failed to deliver to {url}: {exc}")
+            print(f"[api] send_question failed: {exc}")
+            return None
+
+
+def is_answer_correct(answer: str, correct: str) -> bool:
+    return answer.strip().upper() == correct.upper()
+
+
+async def generate_explanation(
+    question_data: dict, answer: str, recent: list[str], client: anthropic.AsyncAnthropic
+) -> str:
+    transcript_text = "\n".join(f"[{i + 1}] {u}" for i, u in enumerate(recent))
+    options_text = "\n".join(f"{chr(65+i)}. {opt}" for i, opt in enumerate(question_data["options"]))
+    correct = question_data["correct_answer"]
+    correct_text = question_data["options"][ord(correct) - ord("A")]
+    resp = await client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=512,
+        messages=[{"role": "user", "content": (
+            f"A student answered a comprehension question incorrectly.\n\n"
+            f"Question: {question_data['question']}\n"
+            f"Options:\n{options_text}\n"
+            f"Student selected: {answer} — Correct answer: {correct}. {correct_text}\n\n"
+            f"Lecture transcript for context:\n{transcript_text}\n\n"
+            "Write a brief, friendly explanation of why the correct answer is right."
+        )}],
+    )
+    return resp.content[0].text.strip()
+
+
+async def send_feedback(question_id: str, session_id: str, explanation: str) -> None:
+    async with httpx.AsyncClient() as http:
+        try:
+            r = await http.post(f"{API_BASE}/api/feedback", json={
+                "question_id": question_id,
+                "session_id": session_id,
+                "explanation": explanation,
+            }, timeout=10.0)
+            r.raise_for_status()
+            print(f"[api] feedback delivered → {r.status_code}")
+        except Exception as exc:
+            print(f"[api] send_feedback failed: {exc}")
 
 
 async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
@@ -155,6 +212,17 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
         await upsert_question(session_id, qid, payload, redis)
         print(f"\n[{session_id}] pos={length} topic={question_data['topic']} difficulty={question_data['difficulty']}")
         print(f"Q: {question_data['question']}\n")
+
+        answer = await send_question(question_data)
+        if not answer:
+            return
+
+        if is_answer_correct(answer, question_data["correct_answer"]):
+            print(f"[{session_id}] correct answer ({answer})")
+        else:
+            print(f"[{session_id}] incorrect answer ({answer}, correct: {question_data['correct_answer']}) — generating explanation…")
+            explanation = await generate_explanation(question_data, answer, recent, client)
+            await send_feedback(qid, session_id, explanation)
 
     except Exception as exc:
         print(f"[{session_id}] error in on_transcript_push: {exc}")
