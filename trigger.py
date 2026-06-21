@@ -23,7 +23,7 @@ from services.redis_service import (
 )
 
 MIN_UTTERANCES = 5       # don't consider asking until session has at least this many
-MIN_NEW_UTTERANCES = 6   # minimum new utterances since last question before re-checking
+MIN_NEW_UTTERANCES = 10   # minimum new utterances since last question before re-checking
 CONTEXT_WINDOW = 15      # number of recent utterances to pass to Claude
 
 # Per-session throttle: maps session_id -> transcript length when last question was generated
@@ -107,7 +107,7 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
     return json.loads(raw)
 
 
-API_BASE = os.environ.get("QUESTION_API_URL", "http://10.43.110.207:3000").rstrip("/")
+API_BASE = os.environ.get("QUESTION_API_URL", "http://10.43.39.220:3000").rstrip("/") # 10.43.110.207
 
 
 async def send_question(question_data: dict) -> str | None:
