@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "redis-core": {
+      "source": "redis/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/redis-core/SKILL.md",
+      "computedHash": "2c0aedf490d57dc8e5ac4d38b5b92b57ceae5ac92ccb4e1ce30c9a0c6f643e30"
+    },
+    "redis-query-engine": {
+      "source": "redis/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/redis-query-engine/SKILL.md",
+      "computedHash": "16acc2aa6c77330fa85be6b55623f5a16f618ad56b3ed9818b3f4ca21c232817"
+    },
+    "redis-vector-search": {
+      "source": "redis/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/redis-vector-search/SKILL.md",
+      "computedHash": "cf3d5d504fad0019b8fac8de2d39a2ff8a0b9545a9f22bb8b58ecc2271ce8748"
+    }
+  }
+}
