@@ -17,9 +17,15 @@ import redis.asyncio as aioredis
 from config import settings
 from services.redis_service import (
     make_text_client,
+    make_binary_client,
+    ensure_vector_index,
     get_recent_transcript,
     transcript_length,
     upsert_question,
+    store_question_embedding,
+    find_similar_questions,
+    get_session_memory,
+    update_session_memory,
 )
 
 MIN_UTTERANCES = 7       # don't consider asking until session has at least this many
@@ -30,6 +36,19 @@ CONTEXT_WINDOW = 15      # number of recent utterances to pass to Claude
 _last_question_at: dict[str, int] = {}
 
 _anthropic_client: anthropic.AsyncAnthropic | None = None
+_embed_model = None
+
+
+def _get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embed_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    return _embed_model
+
+
+def _embed(text: str) -> bytes:
+    return _get_embed_model().encode(text, normalize_embeddings=True).astype("float32").tobytes()
 
 
 def _get_client() -> anthropic.AsyncAnthropic:
@@ -60,9 +79,32 @@ async def is_good_time_to_ask(recent: list[str], client: anthropic.AsyncAnthropi
     return resp.content[0].text.strip().upper().startswith("YES")
 
 
-async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic) -> dict:
+async def generate_question(
+    recent: list[str],
+    client: anthropic.AsyncAnthropic,
+    past_questions: list[str] | None = None,
+    student_memory: dict | None = None,
+) -> dict:
     """Use Claude Opus to generate an MCQ from the recent transcript."""
     transcript_text = "\n".join(f"[{i + 1}] {u}" for i, u in enumerate(recent))
+
+    context_parts = []
+    if past_questions:
+        context_parts.append(
+            "Questions already asked this session (do not repeat these concepts):\n"
+            + "\n".join(f"- {q}" for q in past_questions)
+        )
+    if student_memory:
+        weak = [
+            t for t, s in student_memory.items()
+            if s.get("asked", 0) > 0 and s.get("correct", 0) / s["asked"] < 0.6
+        ]
+        if weak:
+            context_parts.append(
+                f"Topics the student has struggled with (prefer these if relevant): {', '.join(weak)}"
+            )
+    context_block = ("\n\n" + "\n\n".join(context_parts)) if context_parts else ""
+
     resp = await client.messages.create(
         model="claude-opus-4-8",
         max_tokens=512,
@@ -96,7 +138,8 @@ async def generate_question(recent: list[str], client: anthropic.AsyncAnthropic)
             "role": "user",
             "content": (
                 "You are an expert educator. Based on the following snippet of the lecture, "
-                "generate one multiple-choice comprehension question with exactly 4 options (A–D).\n\n"
+                "generate one multiple-choice comprehension question with exactly 4 options (A–D)."
+                f"{context_block}\n\n"
                 f"Recent video context:\n{transcript_text}\n\n"
                 "Return JSON with fields: question (string), options (array of 4 answer strings), "
                 "correct_answer ('A'|'B'|'C'|'D'), topic (string), difficulty ('easy'|'medium'|'hard')."
@@ -169,7 +212,7 @@ async def send_feedback(question_id: str, session_id: str, explanation: str) -> 
             print(f"[api] send_feedback failed: {exc}")
 
 
-async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
+async def on_transcript_push(session_id: str, redis: aioredis.Redis, redis_bin: aioredis.Redis) -> None:
     """Handle a new utterance pushed onto transcript:{session_id}."""
     last_at = _last_question_at.get(session_id, 0)
     question_committed = False
@@ -200,8 +243,15 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
             _last_question_at[session_id] = last_at
             return
 
-        # Step 2: generate the comprehension question
-        question_data = await generate_question(recent, client)
+        # Step 2: fetch memory and similar past questions in parallel
+        query_vec = _embed(" ".join(recent))
+        past_qs, memory = await asyncio.gather(
+            find_similar_questions(query_vec, 3, redis_bin),
+            get_session_memory(session_id, redis),
+        )
+
+        # Step 3: generate the comprehension question with context
+        question_data = await generate_question(recent, client, past_questions=past_qs, student_memory=memory)
         question_committed = True  # question will be sent; reservation is now permanent
 
         qid = str(uuid.uuid4())
@@ -212,7 +262,10 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
             **question_data,
         }
 
-        await upsert_question(session_id, qid, payload, redis)
+        await asyncio.gather(
+            upsert_question(session_id, qid, payload, redis),
+            store_question_embedding(qid, question_data["question"], _embed(question_data["question"]), redis_bin),
+        )
         print(f"\n[{session_id}] pos={length} topic={question_data['topic']} difficulty={question_data['difficulty']}")
         print(f"Q: {question_data['question']}\n")
 
@@ -220,7 +273,10 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
         if not answer:
             return
 
-        if is_answer_correct(answer, question_data["correct_answer"]):
+        correct = is_answer_correct(answer, question_data["correct_answer"])
+        await update_session_memory(session_id, question_data["topic"], correct, redis)
+
+        if correct:
             print(f"[{session_id}] correct answer ({answer})")
         else:
             print(f"[{session_id}] incorrect answer ({answer}, correct: {question_data['correct_answer']}) — generating explanation…")
@@ -234,8 +290,11 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis) -> None:
 
 
 async def main() -> None:
+    _get_embed_model()  # load once before tasks start
     redis = make_text_client()
+    redis_bin = make_binary_client()
     try:
+        await ensure_vector_index(redis)
         pubsub = redis.pubsub()
         await pubsub.subscribe("transcript-events")
 
@@ -246,11 +305,12 @@ async def main() -> None:
 
             session_id = msg["data"]
             print(f"[{session_id}] utterance received")
-            asyncio.create_task(on_transcript_push(session_id, redis))
+            asyncio.create_task(on_transcript_push(session_id, redis, redis_bin))
 
     finally:
         await pubsub.aclose()
         await redis.aclose()
+        await redis_bin.aclose()
 
 
 if __name__ == "__main__":
