@@ -1,3 +1,5 @@
+import json
+
 import redis.asyncio as aioredis
 
 from backend.config import settings
@@ -82,7 +84,6 @@ async def upsert_question(
     redis: aioredis.Redis,
 ) -> None:
     """Write or update a question entry in session:{session_id}:questions."""
-    import json
     existing_raw = await redis.hget(f"session:{session_id}:questions", question_id)
     existing = json.loads(existing_raw) if existing_raw else {}
     existing.update(data)
@@ -98,13 +99,11 @@ async def get_question(
     question_id: str,
     redis: aioredis.Redis,
 ) -> dict | None:
-    import json
     raw = await redis.hget(f"session:{session_id}:questions", question_id)
     return json.loads(raw) if raw else None
 
 
 async def get_all_questions(session_id: str, redis: aioredis.Redis) -> list[dict]:
-    import json
     raw = await redis.hgetall(f"session:{session_id}:questions")
     return [json.loads(v) for v in raw.values()]
 

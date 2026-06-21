@@ -60,6 +60,7 @@ def find_loopback_device() -> tuple[int, str]:
 
 
 def run(session_id: str, device_index: int, device_name: str) -> None:
+    """Capture loopback audio, stream to Deepgram, and append final utterances to Redis."""
     r = redis_sync.from_url(settings.redis_url, decode_responses=True)
     count = 0
     audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
@@ -141,10 +142,10 @@ def run(session_id: str, device_index: int, device_name: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--session-id", default=str(uuid.uuid4()))
-    parser.add_argument("--device", type=int, default=None)
-    parser.add_argument("--list-devices", action="store_true")
+    parser = argparse.ArgumentParser(description="Stream loopback audio through Deepgram into Redis.")
+    parser.add_argument("--session-id", default=str(uuid.uuid4()), help="Session ID (default: new UUID)")
+    parser.add_argument("--device", type=int, default=None, help="Input device index (default: auto-detect loopback)")
+    parser.add_argument("--list-devices", action="store_true", help="List available input devices and exit")
     args = parser.parse_args()
 
     if args.list_devices:

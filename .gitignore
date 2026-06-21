@@ -43,3 +43,5 @@ Thumbs.db
 # Misc
 .vercel
 .netlify
+.agents
+.claude

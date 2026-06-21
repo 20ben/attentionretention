@@ -1,9 +1,25 @@
+"""
+Trigger process: subscribes to Redis pub/sub and fires comprehension questions
+at natural lecture pauses.
+
+Pipeline per utterance event:
+  1. Throttle  — skip if session is too short or too few utterances since last question
+  2. Timing    — Haiku classifies whether the lecturer just finished a thought
+  3. Context   — parallel fetch: similar past questions (vector) + student memory
+  4. Generate  — Opus produces an MCQ, avoiding repeats and targeting weak topics
+  5. Deliver   — POST to the student-facing API; block until the student answers
+  6. Follow-up — on incorrect answer, Opus generates an explanation and POSTs feedback
+
+Usage:
+    python trigger.py
+"""
 import asyncio
 import json
 import os
 import sys
 import uuid
 from pathlib import Path
+from typing import TypedDict
 
 sys.path.insert(0, str(Path(__file__).parent / "backend"))
 
@@ -28,15 +44,44 @@ from services.redis_service import (
     update_session_memory,
 )
 
-MIN_UTTERANCES = 7       # don't consider asking until session has at least this many
-MIN_NEW_UTTERANCES = 7   # minimum new utterances since last question before re-checking
-CONTEXT_WINDOW = 15      # number of recent utterances to pass to Claude
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-# Per-session throttle: maps session_id -> transcript length when last question was generated
+MIN_UTTERANCES = 7        # minimum transcript length before any question is considered
+MIN_NEW_UTTERANCES = 7    # minimum new utterances since last question before re-checking
+CONTEXT_WINDOW = 15       # utterances passed to Claude as context
+
+API_BASE = os.environ.get("QUESTION_API_URL", "http://10.43.39.220:3000").rstrip("/")
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+class QuestionData(TypedDict):
+    question: str
+    options: list[str]
+    correct_answer: str   # "A" | "B" | "C" | "D"
+    topic: str
+    difficulty: str       # "easy" | "medium" | "hard"
+
+# ---------------------------------------------------------------------------
+# Module-level singletons
+# ---------------------------------------------------------------------------
+
+# Maps session_id -> transcript length at the time the last question was generated.
+# Reserved optimistically before any await to prevent duplicate firings for adjacent utterances.
 _last_question_at: dict[str, int] = {}
 
 _anthropic_client: anthropic.AsyncAnthropic | None = None
 _embed_model = None
+
+
+def _get_client() -> anthropic.AsyncAnthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    return _anthropic_client
 
 
 def _get_embed_model():
@@ -50,16 +95,12 @@ def _get_embed_model():
 def _embed(text: str) -> bytes:
     return _get_embed_model().encode(text, normalize_embeddings=True).astype("float32").tobytes()
 
-
-def _get_client() -> anthropic.AsyncAnthropic:
-    global _anthropic_client
-    if _anthropic_client is None:
-        _anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    return _anthropic_client
-
+# ---------------------------------------------------------------------------
+# Claude helpers
+# ---------------------------------------------------------------------------
 
 async def is_good_time_to_ask(recent: list[str], client: anthropic.AsyncAnthropic) -> bool:
-    """Fast Haiku check: has the lecturer just finished a thought or reached a natural pause?"""
+    """Returns True only at natural lecture pauses; rejects mid-thought utterances."""
     transcript_text = "\n".join(f"[{i + 1}] {u}" for i, u in enumerate(recent))
     resp = await client.messages.create(
         model="claude-haiku-4-5",
@@ -84,8 +125,8 @@ async def generate_question(
     client: anthropic.AsyncAnthropic,
     past_questions: list[str] | None = None,
     student_memory: dict | None = None,
-) -> dict:
-    """Use Claude Opus to generate an MCQ from the recent transcript."""
+) -> QuestionData:
+    """Generates an MCQ; past_questions and student_memory are injected as prompt context."""
     transcript_text = "\n".join(f"[{i + 1}] {u}" for i, u in enumerate(recent))
 
     context_parts = []
@@ -115,19 +156,10 @@ async def generate_question(
                     "type": "object",
                     "properties": {
                         "question": {"type": "string"},
-                        "options": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "correct_answer": {
-                            "type": "string",
-                            "enum": ["A", "B", "C", "D"],
-                        },
+                        "options": {"type": "array", "items": {"type": "string"}},
+                        "correct_answer": {"type": "string", "enum": ["A", "B", "C", "D"]},
                         "topic": {"type": "string"},
-                        "difficulty": {
-                            "type": "string",
-                            "enum": ["easy", "medium", "hard"],
-                        },
+                        "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
                     },
                     "required": ["question", "options", "correct_answer", "topic", "difficulty"],
                     "additionalProperties": False,
@@ -150,11 +182,34 @@ async def generate_question(
     return json.loads(raw)
 
 
-API_BASE = os.environ.get("QUESTION_API_URL", "http://10.43.39.220:3000").rstrip("/") # 10.43.110.207
+async def generate_explanation(
+    question_data: QuestionData, answer: str, recent: list[str], client: anthropic.AsyncAnthropic
+) -> str:
+    """Generates targeted remediation; called only on incorrect answers."""
+    transcript_text = "\n".join(f"[{i + 1}] {u}" for i, u in enumerate(recent))
+    options_text = "\n".join(f"{chr(65 + i)}. {opt}" for i, opt in enumerate(question_data["options"]))
+    correct = question_data["correct_answer"]
+    correct_text = question_data["options"][ord(correct) - ord("A")]
+    resp = await client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=512,
+        messages=[{"role": "user", "content": (
+            f"A student answered a comprehension question incorrectly.\n\n"
+            f"Question: {question_data['question']}\n"
+            f"Options:\n{options_text}\n"
+            f"Student selected: {answer} — Correct answer: {correct}. {correct_text}\n\n"
+            f"Lecture video snippet for context:\n{transcript_text}\n\n"
+            "Write a brief, friendly explanation of why the correct answer is right."
+        )}],
+    )
+    return resp.content[0].text.strip()
 
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
 
-async def send_question(question_data: dict) -> str | None:
-    """POST MCQ to /api/send and return the user's selected answer (A/B/C/D)."""
+async def send_question(question_data: QuestionData) -> str | None:
+    """POSTs the MCQ and blocks up to 5 minutes for the student's answer."""
     async with httpx.AsyncClient() as http:
         try:
             r = await http.post(f"{API_BASE}/api/send", json={
@@ -172,33 +227,8 @@ async def send_question(question_data: dict) -> str | None:
             return None
 
 
-def is_answer_correct(answer: str, correct: str) -> bool:
-    return answer.strip().upper() == correct.upper()
-
-
-async def generate_explanation(
-    question_data: dict, answer: str, recent: list[str], client: anthropic.AsyncAnthropic
-) -> str:
-    transcript_text = "\n".join(f"[{i + 1}] {u}" for i, u in enumerate(recent))
-    options_text = "\n".join(f"{chr(65+i)}. {opt}" for i, opt in enumerate(question_data["options"]))
-    correct = question_data["correct_answer"]
-    correct_text = question_data["options"][ord(correct) - ord("A")]
-    resp = await client.messages.create(
-        model="claude-opus-4-8",
-        max_tokens=512,
-        messages=[{"role": "user", "content": (
-            f"A student answered a comprehension question incorrectly.\n\n"
-            f"Question: {question_data['question']}\n"
-            f"Options:\n{options_text}\n"
-            f"Student selected: {answer} — Correct answer: {correct}. {correct_text}\n\n"
-            f"Lecture video snippet for context:\n{transcript_text}\n\n"
-            "Write a brief, friendly explanation of why the correct answer is right."
-        )}],
-    )
-    return resp.content[0].text.strip()
-
-
 async def send_feedback(question_id: str, session_id: str, explanation: str) -> None:
+    """POSTs the explanation for an incorrect answer to /api/feedback."""
     async with httpx.AsyncClient() as http:
         try:
             r = await http.post(f"{API_BASE}/api/feedback", json={
@@ -212,8 +242,15 @@ async def send_feedback(question_id: str, session_id: str, explanation: str) -> 
             print(f"[api] send_feedback failed: {exc}")
 
 
+def is_answer_correct(answer: str, correct: str) -> bool:
+    return answer.strip().upper() == correct.upper()
+
+# ---------------------------------------------------------------------------
+# Core event handler
+# ---------------------------------------------------------------------------
+
 async def on_transcript_push(session_id: str, redis: aioredis.Redis, redis_bin: aioredis.Redis) -> None:
-    """Handle a new utterance pushed onto transcript:{session_id}."""
+    """Throttle-gated pipeline: timing check → context fetch → generation → delivery → follow-up."""
     last_at = _last_question_at.get(session_id, 0)
     question_committed = False
     try:
@@ -224,7 +261,7 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis, redis_bin: 
             return
 
         if length - last_at < MIN_NEW_UTTERANCES:
-            print(f"[{session_id}] skip: only {length - last_at}/{MIN_NEW_UTTERANCES} new utterances since last question")
+            print(f"[{session_id}] skip: only {length - last_at}/{MIN_NEW_UTTERANCES} new since last question")
             return
 
         # Reserve immediately so concurrent tasks don't also pass the throttle check.
@@ -238,7 +275,7 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis, redis_bin: 
 
         client = _get_client()
 
-        # Step 1: fast, cheap classification
+        # Step 1: fast, cheap timing classification
         if not await is_good_time_to_ask(recent, client):
             _last_question_at[session_id] = last_at
             return
@@ -252,7 +289,7 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis, redis_bin: 
 
         # Step 3: generate the comprehension question with context
         question_data = await generate_question(recent, client, past_questions=past_qs, student_memory=memory)
-        question_committed = True  # question will be sent; reservation is now permanent
+        question_committed = True
 
         qid = str(uuid.uuid4())
         payload = {
@@ -279,7 +316,7 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis, redis_bin: 
         if correct:
             print(f"[{session_id}] correct answer ({answer})")
         else:
-            print(f"[{session_id}] incorrect answer ({answer}, correct: {question_data['correct_answer']}) — generating explanation…")
+            print(f"[{session_id}] incorrect ({answer}, correct: {question_data['correct_answer']}) — generating explanation…")
             explanation = await generate_explanation(question_data, answer, recent, client)
             await send_feedback(qid, session_id, explanation)
 
@@ -288,9 +325,12 @@ async def on_transcript_push(session_id: str, redis: aioredis.Redis, redis_bin: 
             _last_question_at[session_id] = last_at
         print(f"[{session_id}] error in on_transcript_push: {exc}")
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 async def main() -> None:
-    _get_embed_model()  # load once before tasks start
+    _get_embed_model()  # warm up before any tasks start
     redis = make_text_client()
     redis_bin = make_binary_client()
     try:
