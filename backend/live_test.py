@@ -111,6 +111,7 @@ def run(session_id: str, device_index: int, device_name: str) -> None:
                             continue
                         if sentence.strip():
                             r.rpush(f"transcript:{session_id}", sentence)
+                            r.publish("transcript-events", session_id)
                             count += 1
                             print(f"[{count}] {sentence}")
                 except Exception:
